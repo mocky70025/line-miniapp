@@ -1,24 +1,45 @@
+// api/apply-event.js
 import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
 
-// DEVバイパス（curlですでに使った方法）
-function devLineUser(req){
+async function readJsonBody(req) {
+  try {
+    if (req.body && typeof req.body === 'object') return req.body;
+    if (typeof req.json === 'function') return await req.json();
+    const chunks = []; for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString('utf8');
+    return raw ? JSON.parse(raw) : {};
+  } catch { return {}; }
+}
+
+async function getLineUserIdOrBypass(req, idToken) {
   const dev = String(process.env.DEV_MODE||'').toLowerCase()==='true';
-  const hdr = (req.headers?.['x-dev-bypass']||'').toString()==='1';
-  if(dev || hdr) return process.env.DEV_FIXED_LINE_USER || 'dev-user';
-  return null;
+  const devHeader = (req.headers?.['x-dev-bypass']||'').toString().toLowerCase()==='1';
+  if (dev || devHeader) return process.env.DEV_FIXED_LINE_USER || 'dev-user';
+
+  if (!idToken || typeof idToken!=='string' || idToken.split('.').length!==3) {
+    const e = new Error('Invalid idToken format (expect JWS x.y.z)'); e.code='INVALID_IDTOKEN_FORMAT'; throw e;
+  }
+  const r = await fetch('https://api.line.me/oauth2/v2.1/verify', {
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body: new URLSearchParams({ id_token:idToken, client_id: process.env.LINE_CHANNEL_ID||'' })
+  });
+  const text = await r.text();
+  if (!r.ok) { const e = new Error(`LINE verify failed: ${r.status} ${text}`); e.code='LINE_VERIFY_FAILED'; throw e; }
+  let data; try { data = JSON.parse(text); } catch { throw new Error(`LINE verify parse error: ${text}`); }
+  if (!data?.sub) throw new Error('LINE user not found in id_token');
+  return data.sub;
 }
 
 export default async function handler(req,res){
-  if(req.method!=='POST') return res.status(405).json({ok:false,message:'Method Not Allowed'});
+  if (req.method!=='POST') return res.status(405).json({ok:false,message:'Method Not Allowed'});
   try{
-    const body = req.body && typeof req.body==='object' ? req.body
-               : JSON.parse((await new Response(req).text?.()) ?? '{}'); // Vercel保険
+    const body = await readJsonBody(req);
     const { event_id, store_name, phone, email, memo, idToken } = body || {};
-    if(!event_id) return res.status(400).json({ok:false,message:'event_id required'});
+    if (!event_id) return res.status(400).json({ok:false,message:'event_id required'});
 
-    // いまは DEV なので idToken 検証は省略。必要になったら create-event と同じ関数を流用。
-    const line_user_id = devLineUser(req) || null;
+    const line_user_id = await getLineUserIdOrBypass(req, idToken);
 
     const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
     const { data, error } = await supa
@@ -33,10 +54,12 @@ export default async function handler(req,res){
       })
       .select('id')
       .single();
-    if(error) throw error;
+
+    if (error) return res.status(400).json({ok:false,message:error.message||String(error)});
 
     return res.status(200).json({ ok:true, application_id: data.id });
-  }catch(e){
-    return res.status(400).json({ ok:false, message:String(e) });
+  } catch (e) {
+    const status = (e?.code==='INVALID_IDTOKEN_FORMAT' || e?.code==='LINE_VERIFY_FAILED') ? 401 : 400;
+    return res.status(status).json({ ok:false, message: e?.message || String(e) });
   }
 }

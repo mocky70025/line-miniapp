@@ -55,7 +55,7 @@
         payload.event_id = eventId;
         const r = await fetch('/api/apply-event', {
           method:'POST',
-          headers:{'Content-Type':'application/json','x-dev-bypass':'1'}, // DEV
+          headers:{'Content-Type':'application/json'}, // DEV
           body: JSON.stringify(payload)
         });
         const j = await r.json().catch(()=> ({}));
