@@ -1,73 +1,106 @@
 <!doctype html><html lang="ja"><head>
     <meta charset="utf-8"/><meta name="viewport" content="width=device-width"/>
     <title>イベント申込</title>
+    <!-- 本番切替時のみ LIFF を使う（DEV中は不要） -->
+    <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
     <style>
       body{font-family:system-ui,-apple-system,sans-serif;padding:16px}
       .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:12px 0}
       input,textarea,button{font-size:16px;padding:10px;width:100%;margin:8px 0}
       img{max-width:100%;border-radius:8px}
+      .meta{color:#666;font-size:14px}
       #msg{white-space:pre-wrap;color:#b00020} #done{color:#0a7}
     </style>
     </head><body>
     <h1>イベント申込</h1>
     
+    <p id="msg"></p>
     <div id="ev" class="card">読み込み中…</div>
     
     <form id="f" class="card">
-      <label>店舗名<input name="store_name" placeholder="例：○○キッチンカー"></label>
+      <label>店舗名<input name="store_name" placeholder="例：○○キッチンカー" required></label>
       <label>電話<input name="phone"></label>
       <label>メール<input name="email" type="email"></label>
       <label>メモ<textarea name="memo" rows="3"></textarea></label>
       <button type="submit">申し込む</button>
     </form>
     
-    <p id="done"></p><p id="msg"></p>
+    <p id="done"></p>
     
     <script>
-    const q = new URLSearchParams(location.search);
-    const eventId = Number(q.get('event_id'));
-    const evBox = document.getElementById('ev');
-    const f = document.getElementById('f');
-    const msg = document.getElementById('msg');
-    const done = document.getElementById('done');
+    const LIFF_ID = "2008126590-J2GZAlnx";   // ← 本番時に使う
+    const DEV_MODE = true;                   // ← 本番切替で false にする
     
-    async function load(){
-      if(!eventId){ evBox.textContent='イベントIDがありません'; f.style.display='none'; return; }
+    const msg  = document.getElementById('msg');
+    const done = document.getElementById('done');
+    const evBox= document.getElementById('ev');
+    const f    = document.getElementById('f');
+    
+    function showErr(e){ msg.textContent = (e?.stack || e?.message || String(e)); }
+    window.addEventListener('error', e=>showErr(e.error||e.message));
+    window.addEventListener('unhandledrejection', e=>showErr(e.reason||e));
+    
+    const q = new URLSearchParams(location.search);
+    // id / event_id のどちらでも拾う。数値以外は弾く
+    const idRaw  = q.get('event_id') ?? q.get('id') ?? '';
+    const eventId= Number.parseInt(String(idRaw), 10);
+    if (!Number.isFinite(eventId) || eventId <= 0) {
+      evBox.textContent = 'イベントIDが不正です。リンク元を確認してください。';
+      f.style.display   = 'none';
+    }
+    
+    async function loadEvent(){
+      if (!Number.isFinite(eventId) || eventId <= 0) return;
       const r = await fetch(`/api/get-event?id=${eventId}`);
-      const j = await r.json().catch(()=> ({}));
-      if(!r.ok || !j.ok){ evBox.textContent='イベント取得に失敗しました'; return; }
-      const ev = j.event;
+      const t = await r.text(); let j={}; try{ j = t? JSON.parse(t):{} }catch(e){ throw new Error('get-event JSON parse error: '+e+'\nraw:'+t); }
+      if(!r.ok || !j.ok) throw new Error(j?.message || `HTTP ${r.status}`);
+      const ev=j.event;
       evBox.innerHTML = `
         ${ev.main_image ? `<img src="${ev.main_image}" alt="">` : ``}
         <h2>${ev.event_name}</h2>
-        <div>${ev.start_date ?? ''} 〜 ${ev.end_date ?? ''}</div>
-        <p>${ev.lead ?? ''}</p>
-        <div>${ev.venue_name ?? ''} ${ev.venue_address ?? ''}</div>
+        <div class="meta">${ev.start_date??''}〜${ev.end_date??''}</div>
+        ${ev.lead ? `<p>${ev.lead}</p>`:''}
+        <div class="meta">${ev.venue_name??''} ${ev.venue_address??''}</div>
       `;
     }
-    load();
+    
+    // 本番時のみ LIFF 初期化して idToken を取得（DEV_MODE=true の間は null を返す）
+    async function maybeInitLiff(){
+      if (!DEV_MODE) {
+        await liff.init({ liffId: LIFF_ID });
+        if (!liff.isLoggedIn()) { liff.login(); return null; }
+        return liff.getIDToken();
+      }
+      return null;
+    }
     
     f.addEventListener('submit', async (e)=>{
       e.preventDefault(); msg.textContent=''; done.textContent='';
       const btn = f.querySelector('button'); btn.disabled=true; btn.textContent='送信中…';
       try{
+        const idToken = await maybeInitLiff();       // DEV=false の時だけ取得
         const payload = Object.fromEntries(new FormData(f).entries());
-        payload.event_id = eventId;
+        payload.event_id = eventId;                  // 数値IDを送る
+    
+        const headers = {'Content-Type':'application/json'};
+        if (DEV_MODE) headers['x-dev-bypass'] = '1'; // DEV中はバイパス
+    
         const r = await fetch('/api/apply-event', {
           method:'POST',
-          headers:{'Content-Type':'application/json'}, // DEV
-          body: JSON.stringify(payload)
+          headers,
+          body: JSON.stringify({ ...payload, idToken })
         });
-        const j = await r.json().catch(()=> ({}));
-        if(!r.ok || !j.ok) throw new Error(j?.message || `HTTP ${r.status}`);
+    
+        const txt = await r.text(); let j={}; try{ j = txt? JSON.parse(txt):{} }catch(e){ throw new Error('apply-event JSON parse error: '+e+'\nraw:'+txt); }
+        if(!r.ok || !j.ok) throw new Error(j?.message || `HTTP ${r.status}: ${txt}`);
+    
         done.textContent = `申し込みを受け付けました（ID: ${j.application_id}）`;
         f.reset();
-      }catch(err){
-        msg.textContent = `失敗: ${String(err)}`;
-      }finally{
-        btn.disabled=false; btn.textContent='申し込む';
-      }
+      }catch(err){ showErr(err); }
+      finally{ btn.disabled=false; btn.textContent='申し込む'; }
     });
+    
+    (async()=>{ await loadEvent(); })();
     </script>
     </body></html>
     

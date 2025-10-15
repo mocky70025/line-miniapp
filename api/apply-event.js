@@ -2,6 +2,7 @@
 import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
 
+/** 本文を堅牢にパース（Vercelの環境差異に強い） */
 async function readJsonBody(req) {
   try {
     if (req.body && typeof req.body === 'object') return req.body;
@@ -12,6 +13,7 @@ async function readJsonBody(req) {
   } catch { return {}; }
 }
 
+/** DEV_MODE ならバイパス、本番は LINE verify。ヘッダでも明示バイパス可。 */
 async function getLineUserIdOrBypass(req, idToken) {
   const dev = String(process.env.DEV_MODE||'').toLowerCase()==='true';
   const devHeader = (req.headers?.['x-dev-bypass']||'').toString().toLowerCase()==='1';
@@ -23,7 +25,7 @@ async function getLineUserIdOrBypass(req, idToken) {
   const r = await fetch('https://api.line.me/oauth2/v2.1/verify', {
     method:'POST',
     headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body: new URLSearchParams({ id_token:idToken, client_id: process.env.LINE_CHANNEL_ID||'' })
+    body: new URLSearchParams({ id_token:idToken, client_id: process.env.LINE_CHANNEL_ID || '' })
   });
   const text = await r.text();
   if (!r.ok) { const e = new Error(`LINE verify failed: ${r.status} ${text}`); e.code='LINE_VERIFY_FAILED'; throw e; }
@@ -37,7 +39,12 @@ export default async function handler(req,res){
   try{
     const body = await readJsonBody(req);
     const { event_id, store_name, phone, email, memo, idToken } = body || {};
-    if (!event_id) return res.status(400).json({ok:false,message:'event_id required'});
+
+    // event_id を厳密に数値化
+    const evId = Number.parseInt(String(event_id ?? ''), 10);
+    if (!Number.isFinite(evId) || evId <= 0) {
+      return res.status(400).json({ ok:false, message:'event_id required' });
+    }
 
     const line_user_id = await getLineUserIdOrBypass(req, idToken);
 
@@ -45,7 +52,7 @@ export default async function handler(req,res){
     const { data, error } = await supa
       .from('event_applications')
       .insert({
-        event_id,
+        event_id: evId,
         line_user_id,
         store_name: store_name ?? null,
         phone: phone ?? null,
@@ -55,7 +62,7 @@ export default async function handler(req,res){
       .select('id')
       .single();
 
-    if (error) return res.status(400).json({ok:false,message:error.message||String(error)});
+    if (error) return res.status(400).json({ ok:false, message: error.message || String(error) });
 
     return res.status(200).json({ ok:true, application_id: data.id });
   } catch (e) {
