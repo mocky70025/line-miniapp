@@ -1,0 +1,73 @@
+<!doctype html><html lang="ja"><head>
+    <meta charset="utf-8"/><meta name="viewport" content="width=device-width"/>
+    <title>イベント申込</title>
+    <style>
+      body{font-family:system-ui,-apple-system,sans-serif;padding:16px}
+      .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:12px 0}
+      input,textarea,button{font-size:16px;padding:10px;width:100%;margin:8px 0}
+      img{max-width:100%;border-radius:8px}
+      #msg{white-space:pre-wrap;color:#b00020} #done{color:#0a7}
+    </style>
+    </head><body>
+    <h1>イベント申込</h1>
+    
+    <div id="ev" class="card">読み込み中…</div>
+    
+    <form id="f" class="card">
+      <label>店舗名<input name="store_name" placeholder="例：○○キッチンカー"></label>
+      <label>電話<input name="phone"></label>
+      <label>メール<input name="email" type="email"></label>
+      <label>メモ<textarea name="memo" rows="3"></textarea></label>
+      <button type="submit">申し込む</button>
+    </form>
+    
+    <p id="done"></p><p id="msg"></p>
+    
+    <script>
+    const q = new URLSearchParams(location.search);
+    const eventId = Number(q.get('event_id'));
+    const evBox = document.getElementById('ev');
+    const f = document.getElementById('f');
+    const msg = document.getElementById('msg');
+    const done = document.getElementById('done');
+    
+    async function load(){
+      if(!eventId){ evBox.textContent='イベントIDがありません'; f.style.display='none'; return; }
+      const r = await fetch(`/api/get-event?id=${eventId}`);
+      const j = await r.json().catch(()=> ({}));
+      if(!r.ok || !j.ok){ evBox.textContent='イベント取得に失敗しました'; return; }
+      const ev = j.event;
+      evBox.innerHTML = `
+        ${ev.main_image ? `<img src="${ev.main_image}" alt="">` : ``}
+        <h2>${ev.event_name}</h2>
+        <div>${ev.start_date ?? ''} 〜 ${ev.end_date ?? ''}</div>
+        <p>${ev.lead ?? ''}</p>
+        <div>${ev.venue_name ?? ''} ${ev.venue_address ?? ''}</div>
+      `;
+    }
+    load();
+    
+    f.addEventListener('submit', async (e)=>{
+      e.preventDefault(); msg.textContent=''; done.textContent='';
+      const btn = f.querySelector('button'); btn.disabled=true; btn.textContent='送信中…';
+      try{
+        const payload = Object.fromEntries(new FormData(f).entries());
+        payload.event_id = eventId;
+        const r = await fetch('/api/apply-event', {
+          method:'POST',
+          headers:{'Content-Type':'application/json','x-dev-bypass':'1'}, // DEV
+          body: JSON.stringify(payload)
+        });
+        const j = await r.json().catch(()=> ({}));
+        if(!r.ok || !j.ok) throw new Error(j?.message || `HTTP ${r.status}`);
+        done.textContent = `申し込みを受け付けました（ID: ${j.application_id}）`;
+        f.reset();
+      }catch(err){
+        msg.textContent = `失敗: ${String(err)}`;
+      }finally{
+        btn.disabled=false; btn.textContent='申し込む';
+      }
+    });
+    </script>
+    </body></html>
+    
