@@ -1,0 +1,86 @@
+<!doctype html><html lang="ja"><head>
+    <meta charset="utf-8"/><meta name="viewport" content="width=device-width"/>
+    <title>主催者ダッシュボード</title>
+    <style>
+     body{font-family:system-ui,-apple-system,sans-serif;padding:16px}
+     select,button{font-size:16px;padding:8px;margin:8px 0}
+     table{width:100%;border-collapse:collapse;margin-top:12px}
+     th,td{border:1px solid #ddd;padding:8px} th{background:#f7f7f7}
+     .ok{color:#0a7}.err{color:#b00020}
+    </style>
+    </head><body>
+    <h1>主催者ダッシュボード</h1>
+    <div id="msg" class="err"></div>
+    
+    <label>イベントを選択:
+      <select id="evsel"></select>
+    </label>
+    
+    <table id="tbl">
+      <thead><tr>
+        <th>ID</th><th>店舗名</th><th>電話</th><th>メール</th>
+        <th>メモ</th><th>状態</th><th>操作</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    
+    <script>
+    const hdr = {'Content-Type':'application/json','x-dev-bypass':'1'}; // DEV
+    const msg = document.getElementById('msg');
+    const sel = document.getElementById('evsel');
+    const tbody = document.querySelector('#tbl tbody');
+    
+    async function loadEvents(){
+      const r = await fetch('/api/host/my-events', { headers: hdr });
+      const j = await r.json().catch(()=>({}));
+      if(!r.ok || !j.ok) throw new Error(j?.message||`HTTP ${r.status}`);
+      sel.innerHTML = '';
+      j.events.forEach(ev=>{
+        const o = document.createElement('option');
+        o.value = ev.id; o.textContent = `${ev.id}: ${ev.event_name}`;
+        sel.appendChild(o);
+      });
+    }
+    
+    async function loadApps(){
+      tbody.innerHTML = '<tr><td colspan="7">読み込み中…</td></tr>';
+      const id = sel.value;
+      const r = await fetch(`/api/host/list-applications?event_id=${id}`, { headers: hdr });
+      const j = await r.json().catch(()=>({}));
+      if(!r.ok || !j.ok) { tbody.innerHTML = '<tr><td colspan="7">取得失敗</td></tr>'; msg.textContent=j?.message||''; return; }
+      tbody.innerHTML = '';
+      j.applications.forEach(a=>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${a.id}</td>
+          <td>${a.store_name||''}</td>
+          <td>${a.phone||''}</td>
+          <td>${a.email||''}</td>
+          <td>${a.memo||''}</td>
+          <td>${a.status}</td>
+          <td>
+            <button data-id="${a.id}" data-s="accepted">承認</button>
+            <button data-id="${a.id}" data-s="rejected">却下</button>
+          </td>`;
+        tbody.appendChild(tr);
+      });
+    }
+    
+    tbody.addEventListener('click', async (e)=>{
+      const b = e.target.closest('button'); if(!b) return;
+      const id = Number(b.dataset.id), status = b.dataset.s;
+      try{
+        const r = await fetch('/api/host/update-application', { method:'POST', headers: hdr, body: JSON.stringify({ application_id:id, status })});
+        const j = await r.json().catch(()=>({}));
+        if(!r.ok || !j.ok) throw new Error(j?.message||`HTTP ${r.status}`);
+        await loadApps();
+      }catch(err){ msg.textContent = String(err); }
+    });
+    
+    (async()=>{
+      try{ await loadEvents(); sel.addEventListener('change', loadApps); if(sel.value) await loadApps(); }
+      catch(e){ msg.textContent = String(e); }
+    })();
+    </script>
+    </body></html>
+    
