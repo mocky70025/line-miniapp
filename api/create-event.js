@@ -2,40 +2,29 @@
 import { createClient } from '@supabase/supabase-js';
 import 'dotenv/config';
 
-/** 空文字を null に変換（Postgres の date/time/text に安全） */
-const toNull = (v) => (v === '' || v === undefined ? null : v);
-
-/** 本文を堅牢にパース（Vercelの環境差分に強い） */
+/** Vercel環境差異に強い JSON パーサ */
 async function readJsonBody(req) {
   try {
     if (req.body && typeof req.body === 'object') return req.body;
     if (typeof req.json === 'function') return await req.json();
-    const chunks = [];
-    for await (const c of req) chunks.push(c);
+    const chunks = []; for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString('utf8');
     return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
+  } catch { return {}; }
 }
 
-/** DEV_MODE ならバイパス、本番は LINE verify。ヘッダでも明示バイパス可。 */
+/** DEV_MODE のときだけ固定ユーザーを返す。本番は LINE verify */
 async function getLineUserIdOrBypass(req, idToken) {
-  const devMode = String(process.env.DEV_MODE || '').toLowerCase() === 'true';
-  const devHeader = (req.headers?.['x-dev-bypass'] || req.headers?.['X-Dev-Bypass'] || '').toString().toLowerCase() === '1';
-  if (devMode || devHeader) {
-    return process.env.DEV_FIXED_LINE_USER || 'dev-user';
-  }
+  const dev = String(process.env.DEV_MODE || '').toLowerCase() === 'true';
+  if (dev) return process.env.DEV_FIXED_LINE_USER || 'dev-user';
 
-  // 本番検証：idToken の形式チェック（JWS 3パート）
+  // 本番ルート：ヘッダのバイパスは無視
   if (!idToken || typeof idToken !== 'string' || idToken.split('.').length !== 3) {
-    const msg = 'Invalid idToken format (expect JWS x.y.z)';
-    const e = new Error(msg);
+    const e = new Error('Invalid idToken format (expect JWS x.y.z)');
     e.code = 'INVALID_IDTOKEN_FORMAT';
     throw e;
   }
-
-  const resp = await fetch('https://api.line.me/oauth2/v2.1/verify', {
+  const r = await fetch('https://api.line.me/oauth2/v2.1/verify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -43,101 +32,102 @@ async function getLineUserIdOrBypass(req, idToken) {
       client_id: process.env.LINE_CHANNEL_ID || '',
     }),
   });
-
-  const text = await resp.text();
-  if (!resp.ok) {
-    const e = new Error(`LINE verify failed: ${resp.status} ${text}`);
+  const text = await r.text();
+  if (!r.ok) {
+    const e = new Error(`LINE verify failed: ${r.status} ${text}`);
     e.code = 'LINE_VERIFY_FAILED';
     throw e;
   }
-
-  let data;
-  try { data = JSON.parse(text); }
-  catch {
-    const e = new Error(`LINE verify parse error: ${text}`);
-    e.code = 'LINE_VERIFY_PARSE_ERROR';
-    throw e;
-  }
-
-  if (!data?.sub) {
-    const e = new Error('LINE user not found in id_token');
-    e.code = 'LINE_SUB_MISSING';
-    throw e;
-  }
+  let data; try { data = JSON.parse(text); } catch { throw new Error(`LINE verify parse error: ${text}`); }
+  if (!data?.sub) throw new Error('LINE user not found in id_token');
   return data.sub; // LINE userId
 }
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ ok: false, message: 'Method Not Allowed' });
+/** サニタイズ/整形 */
+function normalizeEventPayload(input = {}) {
+  const e = { ...input };
+
+  // 型整理
+  const toNum = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
+  e.lat = toNum(e.lat);
+  e.lon = toNum(e.lon);
+
+  // sub_images は配列 or カンマ区切り文字列のどちらでもOK
+  if (Array.isArray(e.sub_images)) {
+    if (!e.sub_images.length) e.sub_images = null;
+  } else if (typeof e.sub_images === 'string') {
+    const arr = e.sub_images.split(',').map(s => s.trim()).filter(Boolean);
+    e.sub_images = arr.length ? arr : null;
+  } else {
+    e.sub_images = null;
   }
 
+  // 空文字は null に統一
+  for (const k of Object.keys(e)) {
+    if (typeof e[k] === 'string' && e[k].trim() === '') e[k] = null;
+  }
+
+  return e;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ ok: false, message: 'Method Not Allowed' });
   try {
     const body = await readJsonBody(req);
-    const { idToken = null, event } = body || {};
+    const { idToken, event } = body || {};
     if (!event || typeof event !== 'object') {
       return res.status(400).json({ ok: false, message: 'event payload required' });
     }
 
-    // 開発: バイパス / 本番: LINE verify
     const line_user_id = await getLineUserIdOrBypass(req, idToken);
+    const payload = normalizeEventPayload(event);
 
-    // Supabase
+    // 必須
+    if (!payload.event_name) return res.status(400).json({ ok: false, message: 'event_name required' });
+
     const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    const { data, error } = await supa
+      .from('events')
+      .insert({
+        // 開発時に作ってきたカラムに合わせてマッピング
+        event_name          : payload.event_name,
+        event_name_kana     : payload.event_name_kana ?? null,
+        genre               : payload.genre ?? null,
+        label               : payload.label ?? null,
+        start_date          : payload.start_date ?? null,
+        end_date            : payload.end_date ?? null,
+        start_time          : payload.start_time ?? null,
+        end_time            : payload.end_time ?? null,
+        apply_start         : payload.apply_start ?? null,
+        apply_end           : payload.apply_end ?? null,
+        lead                : payload.lead ?? null,
+        description         : payload.description ?? null,
+        supplement          : payload.supplement ?? null,
+        main_image          : payload.main_image ?? null,
+        sub_images          : payload.sub_images ?? null, // text[] なら supabase-js が自動で配列保存
+        venue_name          : payload.venue_name ?? null,
+        venue_address       : payload.venue_address ?? null,
+        lat                 : payload.lat,
+        lon                 : payload.lon,
+        organizer           : payload.organizer ?? null,
+        contact_name        : payload.contact_name ?? null,
+        contact_phone       : payload.contact_phone ?? null,
+        contact_email       : payload.contact_email ?? null,
+        price               : payload.price ?? null,
+        ticket_release      : payload.ticket_release ?? null,
+        ticket_place        : payload.ticket_place ?? null,
 
-    // サニタイズ（空文字→null / 配列整形）
-    const payload = {
-      created_by: toNull(line_user_id), // 作成者（hosts.line_user_id などに合わせて使うなら）
-      event_name: event.event_name,
-      event_name_kana: toNull(event.event_name_kana),
-      genre: toNull(event.genre),
-      label: toNull(event.label),
-      lead: toNull(event.lead),
-      description: toNull(event.description),
-      supplement: toNull(event.supplement),
-      main_image: toNull(event.main_image),
-      sub_images: Array.isArray(event.sub_images)
-        ? event.sub_images
-        : (typeof event.sub_images === 'string'
-            ? event.sub_images.split(',').map(s => s.trim()).filter(Boolean)
-            : null),
+        // 追跡用
+        created_by          : line_user_id,
+      })
+      .select('id')
+      .single();
 
-      start_date: toNull(event.start_date),
-      end_date: toNull(event.end_date),
-      start_time: toNull(event.start_time),
-      end_time: toNull(event.end_time),
-
-      apply_start: toNull(event.apply_start),
-      apply_end: toNull(event.apply_end),
-
-      venue_name: toNull(event.venue_name),
-      venue_address: toNull(event.venue_address),
-      lat: event.lat ?? null,
-      lon: event.lon ?? null,
-
-      organizer: toNull(event.organizer),
-      contact_name: toNull(event.contact_name),
-      contact_phone: toNull(event.contact_phone),
-      contact_email: toNull(event.contact_email),
-
-      price: toNull(event.price),
-      ticket_release: toNull(event.ticket_release),
-      ticket_place: toNull(event.ticket_place),
-    };
-
-    // Insert
-    const { data, error } = await supa.from('events').insert(payload).select('id').single();
-    if (error) {
-      // Supabase の詳細をそのまま返す（開発効率重視）
-      return res.status(400).json({ ok: false, message: error.message || String(error), details: error.details || null, code: error.code || null });
-    }
+    if (error) return res.status(400).json({ ok: false, message: error.message || String(error) });
 
     return res.status(200).json({ ok: true, event_id: data.id });
   } catch (e) {
-    const status = (e?.code === 'INVALID_IDTOKEN_FORMAT') ? 400
-                 : (e?.code && String(e.code).startsWith('LINE_')) ? 401
-                 : 400;
-    const message = e?.message || e?.error?.message || JSON.stringify(e);
-    return res.status(status).json({ ok: false, message });
+    const status = (e?.code === 'INVALID_IDTOKEN_FORMAT' || e?.code === 'LINE_VERIFY_FAILED') ? 401 : 400;
+    return res.status(status).json({ ok: false, message: e?.message || String(e) });
   }
 }
